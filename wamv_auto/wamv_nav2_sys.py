@@ -1,3 +1,6 @@
+from os import close
+import nav_msgs
+import nav_msgs.msg
 import rclpy
 from rclpy.node import Node
 
@@ -21,18 +24,21 @@ from wamv_auto.rs_astar import RSAStarPlanner
 import wamv_auto.clothoid as clothoid
 from wamv_auto.pid import PID
 
-
+from nav_msgs.msg import Path
+from rclpy.action import ActionClient
+from nav2_msgs.action import FollowPath
+from action_msgs.msg import GoalStatus
+from geometry_msgs.msg import PoseStamped, Quaternion
+from nav2_regulated_pure_pursuit_controller import RegulatedPurePursuitController
+from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
 
 
 class Auto_sys_status(Enum):
     IDLE = 0
     PLANNING = 1
     NAVIGATING = 2
-    FOLLOW_SEGMENT = 3
-    CUSP_APPROACH = 4
-    TARGET_APPROACH = 5
-    DOCKED = 6
-    ERROR = 7
+    DOCKED = 3
+    ERROR = 4
 
 class wamv_state:
     def __init__(self):
@@ -69,7 +75,7 @@ class wamv(Node):
         self.left_thrust = 0.0
         self.right_thrust = 0.0
         
-        self.pos_pid = PID(kp=0.3, ki=0.0, kd=0.0, output_limits=(-0.78, 0.78), death_zone=(-0.01, 0.01))
+        self.pos_pid = PID(kp=1.0, ki=0.0, kd=0.1, output_limits=(-0.78, 0.78), death_zone=(-0.01, 0.01))
         self.thrust_pid = PID(kp=2000.0, ki=0.0, kd=0.0, output_limits=(-3000.0, 3000.0), death_zone=(-0.02, 0.02))
         
         self.left_pos_pub = self.create_publisher(Float64, '/wamv/thrusters/left/pos', 10)
@@ -89,8 +95,8 @@ class wamv(Node):
         self.thrust_target_pub = self.create_publisher(Float64, '/wamv/thrust_pid/target', 10)
         self.thrust_current_pub = self.create_publisher(Float64, '/wamv/thrust_pid/current', 10)
         
-        self.pid_thread = threading.Thread(target=self.pid_control_thread)
-        self.pid_thread.start()
+        # self.pid_thread = threading.Thread(target=self.pid_control_thread)
+        # self.pid_thread.start()
 
     def collision_callback(self, msg):
         for contact in msg.contacts:
@@ -208,11 +214,11 @@ class wamv(Node):
             rate.sleep()
 
 
-class wamv_auto_sys(Node):
+class wamv_nav2_sys(Node):
     def __init__(self, wamv):
-        super().__init__('wamv_auto_sys')
+        super().__init__('wamv_nav2_sys')
         self.get_logger().set_level(rclpy.logging.LoggingSeverity.DEBUG)
-        self.get_logger().info('WAMV Auto System Node has been started.')
+        self.get_logger().info('WAMV Navigation2 System Node has been started.')
 
         self.wamv = wamv
         self.auto_sys_status = Auto_sys_status.IDLE
@@ -233,12 +239,17 @@ class wamv_auto_sys(Node):
         self.target: wamv_state = wamv_state()
         self.target_received = False
         self.path = []
+        self.nav2_path : Path = []
         
         # Path visualization publisher
         self.path_marker_pub = self.create_publisher(MarkerArray, '/wamv/path_markers', 10)
         self.target_sub = self.create_subscription(Point, '/wamv/target_point', self.target_callback, 10)
         
-        self.thread = threading.Thread(target=self.wamv_auto_sys_thread)
+        self.ac = ActionClient(self, FollowPath, 'follow_path')
+        self._active_goal_handle = None
+        
+
+        self.thread = threading.Thread(target=self.wamv_nav2_sys_thread)
         self.thread.start()
         
         self.control_thread = threading.Thread(target=self.wamv_control_sys_thread)
@@ -246,15 +257,13 @@ class wamv_auto_sys(Node):
         
         # Pure Pursuit 参数
         self.lookahead_distance_base = 2.0  # 基础前瞻距离（米）
-        self.arrival_distance_threshold = 2.0  # 到达阈值（米）
-        self.arrival_heading_threshold = np.radians(15.0)  # 到达时的航向阈值（弧度）
+        self.arrival_threshold = 2.0  # 到达阈值（米）
         self.min_lookahead = 2.0  # 最小前瞻距离
         self.max_lookahead = 5.0  # 最大前瞻距离
         self.lookahead_gain = 1.0  # 前瞻距离与速度的增益系数
         
         # 接近目标的特殊处理参数
-        self.cusp_approach_zone_distance = 2.0 # 接近CUSP区域：2米内启用特殊处理
-        self.target_approach_zone_distance = 5.0  # 接近区域：5米内启用特殊处理
+        self.approach_zone_distance = 5.0  # 接近区域：5米内启用特殊处理
         self.min_approach_speed = 0.3  # 接近时的最低速度
         self.path_progress_threshold = 0.8  # 路径点推进阈值（米）
         
@@ -263,8 +272,6 @@ class wamv_auto_sys(Node):
         self.near_target_timeout = 15.0  # 15秒超时
         
         # 路径推进状态
-        self.current_idx = None
-        self.reverse_switch_idx = None
         self.current_target_idx = 0  # 当前追踪的目标点索引
 
     def target_callback(self, msg):
@@ -278,8 +285,8 @@ class wamv_auto_sys(Node):
     def visualize_target_docking_zone(self):
         """
         使用 Gazebo Marker 可视化目标停泊区域：
-        透明红色框：长度 = 载具长度 + arrival_distance_threshold
-                    宽度 = 载具宽度 + arrival_distance_threshold
+        透明红色框：长度 = 载具长度 + 2×arrival_threshold
+                    宽度 = 载具宽度 + 2×arrival_threshold
         """
         try:
             import subprocess
@@ -289,8 +296,8 @@ class wamv_auto_sys(Node):
             vehicle_width = self.map.vehicle.width if hasattr(self.map, 'vehicle') else 5.0
             
             # 计算红色框尺寸
-            box_length = vehicle_length + 2.0 * self.arrival_distance_threshold
-            box_width = vehicle_width + 2.0 * self.arrival_distance_threshold
+            box_length = vehicle_length + 2.0 * self.arrival_threshold
+            box_width = vehicle_width + 2.0 * self.arrival_threshold
             
             # 绘制透明红色框
             box_marker_cmd = [
@@ -653,286 +660,26 @@ class wamv_auto_sys(Node):
         except subprocess.CalledProcessError as e:
             self.get_logger().error(f'Failed to clear markers in Gazebo Sim: {e.stderr}')
     
-    def find_closest_path_point(self, current_x: float, current_y: float) -> int:
+            
+    def convert_path_to_nav2(self, path):
         """
-        找到路径上离当前位置最近的点的索引
+        将路径转换为 Nav2 可用的格式（PoseStamped 列表）
         
         Args:
-            current_x: 当前 x 坐标
-            current_y: 当前 y 坐标
-        
-        Returns:
-            最近点的索引
         """
-        if not self.path or len(self.path) == 0:
-            return 0
-        
-        min_dist = float('inf')
-        closest_idx = 0
-        
-        for i, point in enumerate(self.path):
-            dx = point[0] - current_x
-            dy = point[1] - current_y
-            dist = np.sqrt(dx**2 + dy**2)
-            
-            if dist < min_dist:
-                min_dist = dist
-                closest_idx = i
-        
-        return closest_idx
-    
-    def pure_pursuit_control(self, lookahead_distance: float) -> tuple:
-        """
-        Pure Pursuit 路径跟踪算法
-        
-        Args:
-            lookahead_distance: 前瞻距离（米）
-        
-        Returns:
-            (target_yaw, target_speed, lookahead_point_idx): 目标航向、速度和前瞻点索引
-        """
-        if not self.path or len(self.path) == 0:
-            return self.wamv.state.yaw, 0.0, 0
-        
-        # 1. 找到最近点
-        closest_idx = self.find_closest_path_point(self.wamv.state.x, self.wamv.state.y)
-        
-        # 2. 在最近点之后寻找与前瞻距离匹配的点
-        lookahead_point = None
-        lookahead_idx = closest_idx
-        
-        for i in range(closest_idx, len(self.path)):
-            dx = self.path[i][0] - self.wamv.state.x
-            dy = self.path[i][1] - self.wamv.state.y
-            dist = np.sqrt(dx**2 + dy**2)
-            
-            if dist >= lookahead_distance:
-                lookahead_point = self.path[i]
-                lookahead_idx = i
-                break
-        
-        # 如果没找到（说明已经接近路径终点），使用最后一个点
-        if lookahead_point is None:
-            lookahead_point = self.path[-1]
-            lookahead_idx = len(self.path) - 1
-        
-        # 3. 计算目标航向（从当前位置指向前瞻点）
-        dx = lookahead_point[0] - self.wamv.state.x
-        dy = lookahead_point[1] - self.wamv.state.y
-        target_yaw = np.arctan2(dy, dx)
-        
-        # 4. 目标速度从路径点获取（假设路径点格式为 [x, y, yaw, u, v_lat, r]）
-        if len(lookahead_point) > 3:
-            target_speed = lookahead_point[3]
-        else:
-            target_speed = 0.0
-        
-        return target_yaw, target_speed, lookahead_idx
-    
-    def get_adaptive_lookahead_distance(self) -> float:
-        """
-        根据速度和换向点自适应调整前瞻距离
-        
-        Returns:
-            自适应的前瞻距离（米）
-        """
-        # 前瞻距离 = 基础距离 + 速度增益 * 当前速度
-        base_lookahead = self.lookahead_distance_base + self.lookahead_gain * abs(self.wamv.state.v)
-        
-        # 限制在合理范围内
-        base_lookahead = np.clip(base_lookahead, self.min_lookahead, self.max_lookahead)
-        
-        # 检查前方是否有换向点
-        if hasattr(self, 'current_target_idx') and self.current_target_idx < len(self.path) - 1:
-            current_speed = self.path[self.current_target_idx][3] if len(self.path[self.current_target_idx]) > 3 else 0.0
-            
-            # 查找最近的换向点（在前方 20 个点内）
-            for i in range(self.current_target_idx + 1, min(self.current_target_idx + 20, len(self.path))):
-                next_speed = self.path[i][3] if len(self.path[i]) > 3 else 0.0
-                if current_speed * next_speed < 0:  # 速度符号变化
-                    # 计算到换向点的距离
-                    dx = self.path[i][0] - self.wamv.state.x
-                    dy = self.path[i][1] - self.wamv.state.y
-                    dist_to_switch = np.sqrt(dx**2 + dy**2)
-                    
-                    # 如果换向点在前瞻距离内，缩短前瞻距离
-                    if dist_to_switch < base_lookahead:
-                        self.get_logger().debug(
-                            f'Reduced lookahead near reverse switch: '
-                            f'{base_lookahead:.2f}m → {dist_to_switch:.2f}m (switch at {dist_to_switch:.2f}m)'
-                        )
-                        return dist_to_switch
-                    break  # 只考虑最近的换向点
-        
-        return base_lookahead
-    
-    def handle_low_speed_approach(self, target_speed: float, dist_to_end: float) -> float:
-        """
-        处理接近目标时的低速情况
-        
-        Args:
-            target_speed: 路径规划的目标速度
-            dist_to_end: 到终点的距离
-        
-        Returns:
-            调整后的目标速度
-        """
-        # 只在接近区域内处理
-        if dist_to_end > self.target_approach_zone_distance:
-            return target_speed
-        
-        if self.reverse_switch_idx is not None:
-            switch_point = self.path[self.reverse_switch_idx]
-            dx_switch = switch_point[0] - self.wamv.state.x
-            dy_switch = switch_point[1] - self.wamv.state.y
-            dist_to_switch = np.sqrt(dx_switch**2 + dy_switch**2)
-            
-            if dist_to_switch < self.cusp_approach_zone_distance:  # 距离换向点 2 米内减速
-                speed_scale = max(0.3, dist_to_switch / self.cusp_approach_zone_distance)
-                original_speed = target_speed
-                target_speed = target_speed * speed_scale
-                if abs(target_speed) < self.min_approach_speed:
-                    target_speed = np.sign(target_speed) * self.min_approach_speed
-                self.get_logger().debug(
-                    f'Slowing near reverse switch: {original_speed:.2f} → {target_speed:.2f} m/s '
-                    f'(dist={dist_to_switch:.2f}m)'
-                )
-        else:
-            # 非换向点附近，正常减速
-            if dist_to_end < self.target_approach_zone_distance:  # 距离终点 5 米内减速
-                speed_scale = max(0.3, dist_to_end / self.target_approach_zone_distance)
-                original_speed = target_speed
-                target_speed = target_speed * speed_scale
-                if abs(target_speed) < self.min_approach_speed:
-                    target_speed = np.sign(target_speed) * self.min_approach_speed
-                self.get_logger().debug(
-                    f'Slowing near end: {original_speed:.2f} → {target_speed:.2f} m/s '
-                    f'(dist={dist_to_end:.2f}m)'
-                )
-        
-        return target_speed
-    
-    def check_arrival_timeout(self, dist_to_end: float) -> bool:
-        """
-        检查是否在接近区域停留过久（超时）
-        
-        Args:
-            dist_to_end: 到终点的距离
-        
-        Returns:
-            True 如果超时应该强制到达
-        """
-        if dist_to_end < self.target_approach_zone_distance:
-            if self.near_target_start_time is None:
-                # 第一次进入接近区域
-                self.near_target_start_time = time.time()
-                self.get_logger().info(f'Entered approach zone ({dist_to_end:.2f}m), starting timeout counter')
-                return False
-            else:
-                # 检查是否超时
-                elapsed = time.time() - self.near_target_start_time
-                if elapsed > self.near_target_timeout:
-                    self.get_logger().warn(
-                        f'Approach timeout ({elapsed:.1f}s > {self.near_target_timeout}s) at {dist_to_end:.2f}m. '
-                        f'Declaring arrival.'
-                    )
-                    return True
-        else:
-            # 离开接近区域，重置计时器
-            self.near_target_start_time = None
-        
-        return False
-    
-    def find_reverse_switch_point(self, current_idx: int):
-        
-        if current_idx < len(self.path):
-            current_speed = self.path[current_idx][3] if len(self.path[current_idx]) > 3 else 0.0
-            
-            for i in range(current_idx + 1, len(self.path)):
-                next_speed = self.path[i][3] if len(self.path[i]) > 3 else 0.0
-                if current_speed * next_speed < 0:  # 速度符号变化
-                    self.get_logger().debug(f'Detected reverse switch at index {i}')
-                    return i
-        
-        return None
-    
-    def progressive_pure_pursuit_control(self, lookahead_distance: float) -> tuple:
-        """
-        渐进式 Pure Pursuit：防止前瞻点跨越换向点
-        
-        Returns:
-            (target_yaw, target_speed, lookahead_idx, current_target_idx)
-        """
-        if not self.path or len(self.path) == 0:
-            return self.wamv.state.yaw, 0.0, 0, 0
-        
-        # 3. 确定搜索前瞻点的最大索引（不能超过换向点）
-        max_search_idx = self.reverse_switch_idx if (self.reverse_switch_idx is not None) else len(self.path)
-        
-        # 4. 在限定范围内寻找前瞻点
-        lookahead_point = None
-        lookahead_idx = self.current_idx
-        
-        for i in range(self.current_idx, max_search_idx):
-            dx = self.path[i][0] - self.wamv.state.x
-            dy = self.path[i][1] - self.wamv.state.y
-            dist = np.sqrt(dx**2 + dy**2)
-            
-            if dist >= lookahead_distance:
-                lookahead_point = self.path[i]
-                lookahead_idx = i
-                break
-        
-        # 如果没找到，使用搜索范围内的最后一个点
-        if lookahead_point is None:
-            lookahead_point = self.path[max_search_idx - 1]
-            lookahead_idx = max_search_idx - 1
-        
-        
-        # 6. 关键修改：使用前瞻点的速度，确保航向和速度一致
-        target_speed = lookahead_point[3] if len(lookahead_point) > 3 else 0.0
-        
-        # 5. 计算目标航向（基于前瞻点）
-        dx = lookahead_point[0] - self.wamv.state.x
-        dy = lookahead_point[1] - self.wamv.state.y
-        target_yaw = np.arctan2(dy, dx)
-        # if target_speed >= 0:
-        # # 前进：船头指向前瞻点
-        #     target_yaw = np.arctan2(dy, dx)
-        # else:
-        #     # 倒车：船尾指向前瞻点，即船头背向前瞻点
-        #     # 方法1：使用路径点的 psi（推荐）
-        #     target_yaw = lookahead_point[2] if len(lookahead_point) > 2 else self.wamv.state.yaw
-        
-        # 7. 如果接近换向点，减速
-        # if self.reverse_switch_idx is not None:
-        #     switch_point = self.path[self.reverse_switch_idx]
-        #     dx_switch = switch_point[0] - self.wamv.state.x
-        #     dy_switch = switch_point[1] - self.wamv.state.y
-        #     dist_to_switch = np.sqrt(dx_switch**2 + dy_switch**2)
-            
-        #     if dist_to_switch < self.cusp_approach_zone_distance:  # 距离换向点 2 米内减速
-        #         speed_scale = max(0.3, dist_to_switch / self.cusp_approach_zone_distance)
-        #         original_speed = target_speed
-        #         target_speed = target_speed * speed_scale
-        #         if abs(target_speed) < self.min_approach_speed:
-        #             target_speed = np.sign(target_speed) * self.min_approach_speed
-        #         self.get_logger().debug(
-        #             f'Slowing near reverse switch: {original_speed:.2f} → {target_speed:.2f} m/s '
-        #             f'(dist={dist_to_switch:.2f}m)'
-        #         )
-        
-        return target_yaw, target_speed, lookahead_idx
-            
-    def get_docking_path(self, target):
-        self.get_logger().info(f'Calculating docking path to target: {target}')
-        
-        docking_path = self.calculate_path(self.wamv.state, target)
-        if docking_path:
-            self.get_logger().info(f'Docking path calculated with {len(docking_path)} points.')
-            self.clear_path_markers()
-            self.show_path()
+        nav2_path : nav_msgs.msg.Path = []
 
+        for point in path:
+            pose = nav_msgs.msg.PoseStamped()
+            pose.header.frame_id = "map"
+            pose.header.stamp = self.get_clock().now().to_msg()
+            pose.pose.position.x = point[0]
+            pose.pose.position.y = point[1]
+            pose.pose.position.z = 0.2
+            pose.pose.orientation = self.get_quaternion_from_yaw(point[2])
+            nav2_path.poses.append(pose)
+
+        return nav2_path
 
     def wamv_auto_sys_thread(self):
         """
@@ -946,18 +693,14 @@ class wamv_auto_sys(Node):
                 if self.auto_sys_status == Auto_sys_status.IDLE:
                     self.get_logger().info('Starting path planning...')
                     self.auto_sys_status = Auto_sys_status.PLANNING
-                    # 重置路径跟踪状态
-                    self.current_target_idx = 0
-                    self.near_target_start_time = None
                     # 清除旧路径并显示目标区域
                     self.clear_path_gz_sim()
                     self.visualize_target_docking_zone()
                     docking_path = self.calculate_path(self.wamv.state, self.target)
-                    if docking_path:
-                        self.get_logger().info(f'Docking path calculated with {len(docking_path)} points.')
-                        self.get_logger().debug(f'Path points: {docking_path}')
-                        # self.clear_path_markers()
-                        # self.show_path()
+                    self.nav2_path = self.convert_path_to_nav2(docking_path)
+                    if self.nav2_path:
+                        self.get_logger().info(f'Docking path calculated with {len(self.nav2_path)} points.')
+                        self.get_logger().debug(f'Path points: {self.nav2_path}')
                         self.show_path_gz_sim()
                         self.auto_sys_status = Auto_sys_status.NAVIGATING
                     else:
@@ -987,176 +730,77 @@ class wamv_auto_sys(Node):
         
         while rclpy.ok():
             if self.auto_sys_status == Auto_sys_status.NAVIGATING:
-                if not self.path or len(self.path) == 0:
-                    self.get_logger().error('Path is empty!')
-                    self.auto_sys_status = Auto_sys_status.IDLE
-                    # 停船
-                    self.wamv.pos_pid.update_target(self.wamv.state.yaw)
-                    self.wamv.thrust_pid.update_target(0.0)
-                    continue
-                else:
-                    self.get_logger().info('Path loaded, switching to FOLLOW_SEGMENT mode')
-                    self.auto_sys_status = Auto_sys_status.FOLLOW_SEGMENT
-                    continue
-            elif self.auto_sys_status == Auto_sys_status.FOLLOW_SEGMENT:
-                closest_idx = self.find_closest_path_point(self.wamv.state.x, self.wamv.state.y)
-                self.current_idx = closest_idx if self.current_idx is None or closest_idx > self.current_idx else self.current_idx
-                self.reverse_switch_idx = self.find_reverse_switch_point(self.current_idx)
-                if self.reverse_switch_idx is not None:
-                    dx = self.path[self.reverse_switch_idx][0] - self.wamv.state.x
-                    dy = self.path[self.reverse_switch_idx][1] - self.wamv.state.y
-                    dist_to_switch = np.sqrt(dx**2 + dy**2)
-                    if dist_to_switch < self.path_progress_threshold:
-                        self.get_logger().info(f'Enter reverse switch point {self.reverse_switch_idx} zone, switching to CUSP_APPROACH mode')
-                        self.auto_sys_status = Auto_sys_status.CUSP_APPROACH
-                    else:
-                        self.get_logger().info(f'Continuing to follow segment, next reverse switch at index {self.reverse_switch_idx} in {dist_to_switch:.2f}m')
-                        lookahead_distance = self.get_adaptive_lookahead_distance()
-                        target_yaw, target_speed, lookahead_idx = \
-                            self.progressive_pure_pursuit_control(lookahead_distance)
-                        # adjusted_speed = self.handle_low_speed_approach(target_speed, dist_to_end=9999.0)  # 大距离，避免低速接近处理
-                        self.wamv.pos_pid.update_target(target_yaw)
-                        self.wamv.thrust_pid.update_target(target_speed)
-                else:
-                    # 检查是否到达路径终点附近
-                    dx_end = self.path[-1][0] - self.wamv.state.x
-                    dy_end = self.path[-1][1] - self.wamv.state.y
-                    dist_to_end = np.sqrt(dx_end**2 + dy_end**2)
-                    if dist_to_end < self.target_approach_zone_distance:
-                        self.get_logger().info(f'Approaching path end ({dist_to_end:.2f}m), switching to TARGET_APPROACH mode')
-                        self.auto_sys_status = Auto_sys_status.TARGET_APPROACH
-                    else:
-                        self.get_logger().info(f'Continuing to follow segment, distance to end: {dist_to_end:.2f}m')
-                        lookahead_distance = self.get_adaptive_lookahead_distance()
-                        target_yaw, target_speed, lookahead_idx = \
-                            self.progressive_pure_pursuit_control(lookahead_distance)
-                        # adjusted_speed = self.handle_low_speed_approach(target_speed, dist_to_end=9999.0)  # 大距离，避免低速接近处理
-                        self.wamv.pos_pid.update_target(target_yaw)
-                        self.wamv.thrust_pid.update_target(target_speed)
-            elif self.auto_sys_status == Auto_sys_status.CUSP_APPROACH:
-                dx_switch = self.path[self.reverse_switch_idx][0] - self.wamv.state.x
-                dy_switch = self.path[self.reverse_switch_idx][1] - self.wamv.state.y
-                dist_to_switch = np.sqrt(dx_switch**2 + dy_switch**2)
-                
-                if dist_to_switch < self.arrival_distance_threshold:
-                    self.get_logger().info(f'Reached reverse switch point {self.reverse_switch_idx}, switching direction.')
-                    # 切换方向
-                    self.current_idx = self.reverse_switch_idx
-                    self.auto_sys_status = Auto_sys_status.FOLLOW_SEGMENT
-                else:
-                    if self.wamv.thrust_pid.enable_death_zone:
-                        self.wamv.thrust_pid.enable_death_zone = False
-                        self.get_logger().info(
-                            f'Entering cusp approach zone ({dist_to_switch:.2f}m), disabling thrust death zone'
-                        )
-                    lookahead_distance = self.get_adaptive_lookahead_distance()
-                    target_yaw, target_speed, lookahead_idx = \
-                        self.progressive_pure_pursuit_control(lookahead_distance)
-                    adjusted_speed = self.handle_low_speed_approach(target_speed, dist_to_switch)
-                    self.wamv.pos_pid.update_target(target_yaw)
-                    self.wamv.thrust_pid.update_target(adjusted_speed)
-            elif self.auto_sys_status == Auto_sys_status.TARGET_APPROACH:
-                # 1. 计算到终点的距离
-                dx_end = self.path[-1][0] - self.wamv.state.x
-                dy_end = self.path[-1][1] - self.wamv.state.y
-                dist_to_end = np.sqrt(dx_end**2 + dy_end**2)
-                
-                # 3. 到达检查
-                if dist_to_end < self.arrival_distance_threshold:
-                    if abs(self.wamv.state.yaw - self.path[-1][2]) < self.arrival_heading_threshold:
-                        self.get_logger().info(f'Arrived at destination! Distance: {dist_to_end:.2f}m')
-                        # 停船：保持目标航向，推力设为0
-                        self.wamv.pos_pid.update_target(self.path[-1][2])
-                        self.wamv.thrust_pid.update_target(0.0)
-                        # 恢复死区设置
-                        self.wamv.thrust_pid.enable_death_zone = True
-                        self.auto_sys_status = Auto_sys_status.DOCKED
-                    else:
-                        self.get_logger().info(
-                            f'Close to destination ({dist_to_end:.2f}m) but heading error too large '
-                            f'(Current: {self.wamv.state.yaw:.2f} rad, Target: ), adjusting...'
-                        )
-                else:
-                    self.get_logger().info(f'Approaching destination, distance to end: {dist_to_end:.2f}m')
-                    if self.wamv.thrust_pid.enable_death_zone:
-                        self.wamv.thrust_pid.enable_death_zone = False
-                        self.get_logger().info(
-                            f'Entering approach zone ({dist_to_end:.2f}m), disabling thrust death zone'
-                        )
-                    lookahead_distance = self.get_adaptive_lookahead_distance()
-                    target_yaw, target_speed, lookahead_idx = \
-                        self.progressive_pure_pursuit_control(lookahead_distance)
-                    adjusted_speed = self.handle_low_speed_approach(target_speed, dist_to_end)
-                    self.wamv.pos_pid.update_target(target_yaw)
-                    self.wamv.thrust_pid.update_target(adjusted_speed)
-                
-                # # 2. 超时检查（优先级高于正常到达检查）
-                # if self.check_arrival_timeout(dist_to_end):
-                #     self.get_logger().warn(f'Forcing arrival due to timeout at {dist_to_end:.2f}m')
-                #     # 强制到达
-                #     self.wamv.pos_pid.update_target(self.path[-1][2])
-                #     self.wamv.thrust_pid.update_target(0.0)
-                #     self.wamv.thrust_pid.enable_death_zone = True
-                #     self.auto_sys_status = Auto_sys_status.DOCKED
-                #     continue
-                
-                
-                
+                self.send_active_goal(self.nav2_path)
             
             elif self.auto_sys_status == Auto_sys_status.DOCKED:
                 # 保持停船状态
                 self.wamv.thrust_pid.update_target(0.0)
-                
-            # 9. 日志输出（每秒输出一次）
-            current_time = time.time()
-            if self.auto_sys_status in [Auto_sys_status.FOLLOW_SEGMENT, Auto_sys_status.CUSP_APPROACH, Auto_sys_status.TARGET_APPROACH, Auto_sys_status.DOCKED]\
-                and (not hasattr(self, '_last_log_time') or (current_time - self._last_log_time) >= 1.0):
-                self._last_log_time = current_time
-                    
-                # 计算横向误差
-                closest_idx = self.find_closest_path_point(self.wamv.state.x, self.wamv.state.y)
-                closest_point = self.path[closest_idx]
-                dx_closest = closest_point[0] - self.wamv.state.x
-                dy_closest = closest_point[1] - self.wamv.state.y
-                cross_track_error = np.sqrt(dx_closest**2 + dy_closest**2)
-                    
-                # 计算航向误差
-                heading_error = target_yaw - self.wamv.state.yaw
-                heading_error = np.arctan2(np.sin(heading_error), np.cos(heading_error))
-                    
-                    # # 计算剩余超时时间
-                    # timeout_info = ""
-                    # if self.near_target_start_time is not None:
-                    #     elapsed = time.time() - self.near_target_start_time
-                    #     remaining = self.near_target_timeout - elapsed
-                    #     timeout_info = f", timeout in {remaining:.1f}s"
-                    
-                self.get_logger().info(
-                    f'Enhanced Pure Pursuit Status:\n'
-                    f'  Progress: waypoint {self.current_idx}/{len(self.path)}, '
-                    f'lookahead {lookahead_idx}/{len(self.path)} '
-                    f'({100.0*self.current_idx/len(self.path):.1f}%)\n'
-                    f'  Distance to end: {dist_to_end:.2f}m\n'
-                    f'  Lookahead distance: {lookahead_distance:.2f}m\n'
-                    f'  Current: pos=({self.wamv.state.x:.2f}, {self.wamv.state.y:.2f}), '
-                    f'yaw={np.degrees(self.wamv.state.yaw):.1f}°, speed={self.wamv.state.v:.2f}m/s\n'
-                    f'  Target: yaw={np.degrees(target_yaw):.1f}°, '
-                    f'speed={target_speed:.2f}{"→" if self.auto_sys_status in [Auto_sys_status.CUSP_APPROACH, Auto_sys_status.TARGET_APPROACH] else ""}{adjusted_speed if self.auto_sys_status in [Auto_sys_status.CUSP_APPROACH, Auto_sys_status.TARGET_APPROACH] else ""}m/s\n'
-                    f'  Errors: cross_track={cross_track_error:.2f}m, heading={np.degrees(heading_error):.1f}°\n'
-                    f'  Death zone: {"DISABLED" if not self.wamv.thrust_pid.enable_death_zone else "ENABLED"}'
-                )
         
             time.sleep(0.1)
             
+    def cancel_active_goal(self):
+        if self._active_goal_handle is not None:
+            try:
+                cancel_future = self._active_goal_handle.cancel_goal_async()
+                rclpy.spin_until_future_complete(self, cancel_future)
+                self.get_logger().info('Active goal cancelled successfully.')
+            except Exception as e:
+                self.get_logger().error(f'Failed to cancel active goal: {e}')
+            self._active_goal_handle = None
+            
+    def send_active_goal(self, path: Path):
+        if not self.ac.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error('Action server not available!')
+            return
+        
+        self.cancel_active_goal()
+        
+        path.header.stamp = self.get_clock().now().to_msg()
+        goal_msg = FollowPath.Goal()
+        goal_msg.path = path
+        goal_msg.controller_id = "FollowPath"
+        
+        self.get_logger().info('Sending new goal to FollowPath action server...')
+        send_goal_future = self.ac.send_goal_async(goal_msg, feedback_callback=self.on_feedback)
+
+        send_goal_future.add_done_callback(self.on_goal_response)
+        
+    def on_feedback(self, feedback_msg):
+        feedback = feedback_msg.feedback
+        self.get_logger().debug(f'Feedback received: {feedback}')
+        self.get_logger().info(f'Received feedback: {feedback.current_waypoint}/{feedback.total_waypoints} waypoints reached.')
+
+    def on_goal_response(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().info('Goal rejected :(')
+            self._active_goal_handle = None
+            return
+
+        self.get_logger().info('Goal accepted :)')
+        self._active_goal_handle = goal_handle
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self.on_get_result)
+            
+    def on_get_result(self, future):
+        try:
+            result = future.result()
+            status = result.status
+            self.get_logger().info(f'Goal result received with status: {status}')
+            if status == GoalStatus.STATUS_SUCCEEDED:
+                self.auto_sys_status = Auto_sys_status.DOCKED
+        finally:
+            self._active_goal_handle = None
+
 def main(args=None):
     rclpy.init(args=args)
     
     wamv_node = wamv()
 
-    wamv_auto_sys_node = wamv_auto_sys(wamv=wamv_node)
+    wamv_nav2_sys_node = wamv_nav2_sys(wamv=wamv_node)
 
     executor = rclpy.executors.MultiThreadedExecutor()
-    executor.add_node(wamv_auto_sys_node)
+    executor.add_node(wamv_nav2_sys_node)
     executor.add_node(wamv_node)
     executor.spin()
     # rclpy.spin(wamv_auto_sys_node)

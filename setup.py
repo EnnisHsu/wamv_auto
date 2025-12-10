@@ -21,6 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
             'wamv_auto_sys.py = wamv_auto.wamv_auto_sys:main'
+            # 'wamv_nav2_sys.py = wamv_auto.wamv_nav2_sys:main'
         ],
     },
 )
