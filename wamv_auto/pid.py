@@ -1,4 +1,5 @@
 import time
+import numpy as np
 
 class PID:
     def __init__(self, kp, ki, kd, target=0.0, death_zone=(None, None), output_limits=(None, None), sample_time=0.01):
@@ -27,10 +28,13 @@ class PID:
         
     def update_current(self, current):
         self.current = current
+        
+    def comput_error(self, old_data, new_data):
+        return new_data - old_data
 
     def compute(self) -> float:
         current_time = time.time()
-        error = self.target - self.current
+        error = self.comput_error(self.current, self.target)
 
         if self._last_time is None:
             self._last_time = current_time
@@ -64,7 +68,7 @@ class PID:
         self._integral += error * dt
 
         # 微分项
-        derivative = (error - self._prev_error) / dt if dt > 0 else 0.0
+        derivative = self.comput_error(self._prev_error, error) / dt if dt > 0 else 0.0
 
         # PID 输出
         output = self.kp * error + self.ki * self._integral + self.kd * derivative
@@ -81,3 +85,9 @@ class PID:
         self._last_time = current_time
 
         return output
+
+class POS_PID(PID):
+    def comput_error(self, old_data, new_data):
+        # 位置环误差计算
+        error = new_data - old_data
+        return np.arctan2(np.sin(error), np.cos(error))  # 归一化到 [-π, π]
