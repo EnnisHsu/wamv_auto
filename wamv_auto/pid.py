@@ -8,6 +8,7 @@ class PID:
         self.kd = kd                # 微分系数
         self.target = target        # 目标值
         self.current = 0.0
+        self.output = 0.0
 
         self._integral = 0.0
         self._prev_error = 0.0
@@ -83,6 +84,7 @@ class PID:
         # 更新状态
         self._prev_error = error
         self._last_time = current_time
+        self.output = output
 
         return output
 

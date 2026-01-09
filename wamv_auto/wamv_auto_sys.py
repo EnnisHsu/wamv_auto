@@ -6,6 +6,8 @@ import threading
 import subprocess
 import numpy as np
 from enum import Enum
+import os
+import csv
 
 
 from std_msgs.msg import Float64
@@ -70,7 +72,7 @@ class wamv(Node):
         self.left_thrust = 0.0
         self.right_thrust = 0.0
         
-        self.pos_pid = POS_PID(kp=0.3, ki=0.0, kd=0.0, output_limits=(-0.78, 0.78), death_zone=(-0.01, 0.01))
+        self.pos_pid = POS_PID(kp=0.5, ki=0.0, kd=0.0, output_limits=(-0.78, 0.78), death_zone=(-0.01, 0.01))
         self.thrust_pid = PID(kp=2000.0, ki=0.0, kd=0.0, output_limits=(-3000.0, 3000.0), death_zone=(-0.02, 0.02))
         
         self.left_pos_pub = self.create_publisher(Float64, '/wamv/thrusters/left/pos', 10)
@@ -87,8 +89,10 @@ class wamv(Node):
         # PID 监控话题发布器（用于 rqt_plot 可视化）
         self.pos_target_pub = self.create_publisher(Float64, '/wamv/pos_pid/target', 10)
         self.pos_current_pub = self.create_publisher(Float64, '/wamv/pos_pid/current', 10)
+        self.pos_output_pub = self.create_publisher(Float64, '/wamv/pos_pid/output', 10)
         self.thrust_target_pub = self.create_publisher(Float64, '/wamv/thrust_pid/target', 10)
         self.thrust_current_pub = self.create_publisher(Float64, '/wamv/thrust_pid/current', 10)
+        self.thrust_output_pub = self.create_publisher(Float64, '/wamv/thrust_pid/output', 10)
         
         self.pid_thread = threading.Thread(target=self.pid_control_thread)
         self.pid_thread.start()
@@ -193,8 +197,10 @@ class wamv(Node):
                 # 5. 发布 PID 监控数据供 rqt_plot 使用
                 self.pos_target_pub.publish(Float64(data=self.pos_pid.target))
                 self.pos_current_pub.publish(Float64(data=self.pos_pid.current))
+                self.pos_output_pub.publish(Float64(data=pos_cmd))
                 self.thrust_target_pub.publish(Float64(data=self.thrust_pid.target))
                 self.thrust_current_pub.publish(Float64(data=self.thrust_pid.current))
+                self.thrust_output_pub.publish(Float64(data=thrust_cmd))
             else:
                 self.get_logger().warn('Odometry not ready, stop wamv.')
                 self.pos_pid.update_target(self.state.yaw)
@@ -257,8 +263,8 @@ class wamv_auto_sys(Node):
         # 接近目标的特殊处理参数
         self.cusp_approach_zone_distance = 2.0 # 接近CUSP区域：2米内启用特殊处理
         self.target_approach_zone_distance = 5.0  # 接近区域：5米内启用特殊处理
-        self.min_approach_speed = 0.3  # 接近时的最低速度
-        self.path_progress_threshold = 0.8  # 路径点推进阈值（米）
+        self.min_approach_speed = 0.2  # 接近时的最低速度
+        self.cusp_arrival_threshold = 0.8  # 路径点推进阈值（米）
         
         # 超时保护
         self.near_target_start_time = None
@@ -269,12 +275,310 @@ class wamv_auto_sys(Node):
         self.reverse_switch_idx = None
         self.current_target_idx = 0  # 当前追踪的目标点索引
 
+        # ---------------- 任务日志（每次任务一个 run 目录） ----------------
+        # 目录结构：logs/<YYYYmmdd_HHMMSS>/meta.csv planning_path.csv navigating.csv
+        self.logs_root_dir = os.path.join(os.getcwd(), 'logs')
+        self.run_dir = None
+        self.run_id = None
+        self.run_start_time_unix = None
+        self.run_end_time_unix = None
+
+        self._nav_csv_fp = None
+        self._nav_csv_writer = None
+        self._nav_csv_header_written = False
+        self._nav_last_flush_time = 0.0
+        self._nav_flush_interval_sec = 1.0
+
+        self._run_status = None  # DOCKED/ERROR/ABORTED/...
+        self._run_collision = False
+        self._run_start_pose = None  # (x,y,yaw)
+        self._run_target_pose = None  # (x,y,yaw)
+        self._run_path_stats = None  # {'points': int, 'length_m': float, 'reverse_switches': int}
+
     def target_callback(self, msg):
         self.target.x = msg.x
         self.target.y = msg.y
         self.target.yaw = msg.z
         self.get_logger().info(f'Target point received: ({self.target.x:.2f}, {self.target.y:.2f}, {np.degrees(self.target.yaw):.1f}°)')
         self.target_received = True
+
+    # ---------------- Logging helpers ----------------
+    def _format_run_id(self, t_unix: float) -> str:
+        return time.strftime('%Y%m%d_%H%M%S', time.localtime(t_unix))
+
+    def _safe_float(self, x):
+        try:
+            return float(x)
+        except Exception:
+            return None
+
+    def _estimate_path_length_m(self, path_points) -> float:
+        if not path_points or len(path_points) < 2:
+            return 0.0
+        total = 0.0
+        for i in range(1, len(path_points)):
+            try:
+                dx = float(path_points[i][0]) - float(path_points[i - 1][0])
+                dy = float(path_points[i][1]) - float(path_points[i - 1][1])
+                total += float(np.hypot(dx, dy))
+            except Exception:
+                continue
+        return float(total)
+
+    def _count_reverse_switches(self, path_points) -> int:
+        """基于路径点的速度 u 符号变化统计换向次数（粗略统计）。"""
+        if not path_points or len(path_points) < 2:
+            return 0
+        # pack_points_with_velocity: (x,y,psi,u,v_lat,r,t)
+        u_list = []
+        for p in path_points:
+            if isinstance(p, (list, tuple)) and len(p) >= 4:
+                try:
+                    u_list.append(float(p[3]))
+                except Exception:
+                    pass
+        if len(u_list) < 2:
+            return 0
+
+        def _sgn(v: float) -> int:
+            if v > 1e-6:
+                return 1
+            if v < -1e-6:
+                return -1
+            return 0
+
+        switches = 0
+        prev = _sgn(u_list[0])
+        for u in u_list[1:]:
+            cur = _sgn(u)
+            if cur == 0:
+                continue
+            if prev == 0:
+                prev = cur
+                continue
+            if cur != prev:
+                switches += 1
+                prev = cur
+        return switches
+
+    def _write_meta_csv(self, meta_items: list[tuple[str, object]]):
+        if not self.run_dir:
+            return
+        meta_path = os.path.join(self.run_dir, 'meta.csv')
+        try:
+            with open(meta_path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['key', 'value'])
+                for k, v in meta_items:
+                    writer.writerow([k, v])
+        except Exception as e:
+            self.get_logger().error(f'Failed to write meta.csv: {e}')
+
+    def _start_new_run_logging(self):
+        """在每次开始规划时调用，创建 run 目录并写入 meta.csv（start 信息）。"""
+        self._finalize_run_logging(result='ABORTED', reason='new_run_started')
+
+        t0 = time.time()
+        self.run_start_time_unix = t0
+        self.run_end_time_unix = None
+        self.run_id = self._format_run_id(t0)
+        self.run_dir = os.path.join(self.logs_root_dir, self.run_id)
+        self._run_status = None
+        self._run_collision = bool(getattr(self.wamv, 'collision_flag', False))
+        self._run_start_pose = (self._safe_float(self.wamv.state.x), self._safe_float(self.wamv.state.y), self._safe_float(self.wamv.state.yaw))
+        self._run_target_pose = (self._safe_float(self.target.x), self._safe_float(self.target.y), self._safe_float(self.target.yaw))
+        self._run_path_stats = None
+
+        # （重新）打开 navigating.csv
+        try:
+            os.makedirs(self.run_dir, exist_ok=True)
+            nav_path = os.path.join(self.run_dir, 'navigating.csv')
+            self._nav_csv_fp = open(nav_path, 'w', newline='')
+            self._nav_csv_writer = csv.writer(self._nav_csv_fp)
+            self._nav_csv_header_written = False
+            self._nav_last_flush_time = 0.0
+        except Exception as e:
+            self.get_logger().error(f'Failed to open navigating.csv: {e}')
+            self._nav_csv_fp = None
+            self._nav_csv_writer = None
+
+        # 先写一版 meta（运行结束再补 end/result）
+        meta = [
+            ('run_id', self.run_id),
+            ('start_time_unix', self.run_start_time_unix),
+            ('start_time_iso', time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.run_start_time_unix))),
+            ('result', ''),
+            ('end_time_unix', ''),
+            ('end_time_iso', ''),
+            ('duration_sec', ''),
+            ('collision', int(self._run_collision)),
+            ('start_x', self._run_start_pose[0]),
+            ('start_y', self._run_start_pose[1]),
+            ('start_yaw', self._run_start_pose[2]),
+            ('target_x', self._run_target_pose[0]),
+            ('target_y', self._run_target_pose[1]),
+            ('target_yaw', self._run_target_pose[2]),
+            ('lookahead_distance_base', self.lookahead_distance_base),
+            ('lookahead_gain', self.lookahead_gain),
+            ('min_lookahead', self.min_lookahead),
+            ('max_lookahead', self.max_lookahead),
+            ('arrival_distance_threshold', self.arrival_distance_threshold),
+            ('arrival_heading_threshold_deg', float(np.degrees(self.arrival_heading_threshold))),
+            ('planner', 'RSAStarPlanner + clothoid.fit_and_speed + clothoid.resample_uniform_time'),
+        ]
+        self._write_meta_csv(meta)
+        self.get_logger().info(f'Run logging started: {self.run_dir}')
+
+    def _log_planning_path_csv(self, path):
+        """保存规划路径：planning_path.csv（优先保存 clothoid 输出的完整列）。"""
+        if not self.run_dir:
+            return
+        try:
+            out_path = os.path.join(self.run_dir, 'planning_path.csv')
+            with open(out_path, 'w', newline='') as f:
+                w = csv.writer(f)
+                w.writerow(['x', 'y', 'psi', 'u', 'v_lat', 'r', 't'])
+                for p in (path):
+                    if isinstance(p, (list, tuple)) and len(p) >= 7:
+                        w.writerow([p[0], p[1], p[2], p[3], p[4], p[5], p[6]])
+        except Exception as e:
+            self.get_logger().error(f'Failed to write planning_path.csv: {e}')
+
+    def _ensure_nav_header(self):
+        if not self._nav_csv_writer or self._nav_csv_header_written:
+            return
+        header = [
+            't_unix', 't_from_start',
+            'status',
+            'x', 'y', 'yaw', 'v',
+            'target_yaw', 'target_speed',
+            'current_idx', 'lookahead_idx', 'segment_start_idx', 'segment_end_idx', 'reverse_switch_idx',
+            'dist_to_end', 'dist_to_switch',
+            'pos_pid_target', 'pos_pid_current', 'pos_pid_output',
+            'thrust_pid_target', 'thrust_pid_current', 'thrust_pid_output',
+        ]
+        self._nav_csv_writer.writerow(header)
+        self._nav_csv_header_written = True
+
+    def _append_nav_row(self,
+                        target_yaw=None,
+                        target_speed=None,
+                        lookahead_idx=None,
+                        dist_to_end=None,
+                        dist_to_switch=None):
+        if not self._nav_csv_writer or not self.run_start_time_unix:
+            return
+        self._ensure_nav_header()
+
+        now = time.time()
+        row = [
+            now,
+            now - self.run_start_time_unix,
+            getattr(self.auto_sys_status, 'name', str(self.auto_sys_status)),
+            self._safe_float(self.wamv.state.x),
+            self._safe_float(self.wamv.state.y),
+            self._safe_float(self.wamv.state.yaw),
+            self._safe_float(self.wamv.state.v),
+            self._safe_float(target_yaw),
+            self._safe_float(target_speed),
+            int(self.current_idx) if self.current_idx is not None else '',
+            int(lookahead_idx) if lookahead_idx is not None else '',
+            int(getattr(self, 'segment_start_idx', -1)) if getattr(self, 'segment_start_idx', None) is not None else '',
+            int(getattr(self, 'segment_end_idx', -1)) if getattr(self, 'segment_end_idx', None) is not None else '',
+            int(self.reverse_switch_idx) if self.reverse_switch_idx is not None else '',
+            self._safe_float(dist_to_end),
+            self._safe_float(dist_to_switch),
+            self._safe_float(getattr(self.wamv.pos_pid, 'target', None)),
+            self._safe_float(getattr(self.wamv.pos_pid, 'current', None)),
+            self._safe_float(getattr(self.wamv.pos_pid, 'output', None)),
+            self._safe_float(getattr(self.wamv.thrust_pid, 'target', None)),
+            self._safe_float(getattr(self.wamv.thrust_pid, 'current', None)),
+            self._safe_float(getattr(self.wamv.thrust_pid, 'output', None)),
+        ]
+        try:
+            self._nav_csv_writer.writerow(row)
+            # 定期 flush，避免宕机丢数据
+            if self._nav_csv_fp and (now - self._nav_last_flush_time) >= self._nav_flush_interval_sec:
+                self._nav_csv_fp.flush()
+                self._nav_last_flush_time = now
+        except Exception as e:
+            self.get_logger().error(f'Failed to append navigating.csv row: {e}')
+
+    def _finalize_run_logging(self, result: str, reason: str = ''):
+        """任务结束/被覆盖时调用：flush 关闭 & 重写 meta.csv（补 end/result/stats）。"""
+        if not self.run_dir or not self.run_start_time_unix:
+            # 确保文件句柄不泄漏
+            if self._nav_csv_fp:
+                try:
+                    self._nav_csv_fp.close()
+                except Exception:
+                    pass
+            self._nav_csv_fp = None
+            self._nav_csv_writer = None
+            self._nav_csv_header_written = False
+            self.run_dir = None
+            self.run_id = None
+            self.run_start_time_unix = None
+            return
+
+        self.run_end_time_unix = time.time()
+        duration = self.run_end_time_unix - self.run_start_time_unix
+        self._run_status = result
+        self._run_collision = bool(getattr(self.wamv, 'collision_flag', False))
+
+        # 关闭导航 CSV
+        try:
+            if self._nav_csv_fp:
+                self._nav_csv_fp.flush()
+                self._nav_csv_fp.close()
+        except Exception:
+            pass
+        self._nav_csv_fp = None
+        self._nav_csv_writer = None
+        self._nav_csv_header_written = False
+
+        # meta 补全（并附加路径统计）
+        path_points = self.path if isinstance(self.path, list) else None
+        stats_points = len(path_points) if path_points else 0
+        stats_len = self._estimate_path_length_m(path_points) if path_points else 0.0
+        stats_switch = self._count_reverse_switches(path_points) if path_points else 0
+
+        meta = [
+            ('run_id', self.run_id),
+            ('start_time_unix', self.run_start_time_unix),
+            ('start_time_iso', time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.run_start_time_unix))),
+            ('end_time_unix', self.run_end_time_unix),
+            ('end_time_iso', time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.run_end_time_unix))),
+            ('duration_sec', duration),
+            ('result', self._run_status),
+            ('reason', reason),
+            ('collision', int(self._run_collision)),
+            ('start_x', self._run_start_pose[0] if self._run_start_pose else ''),
+            ('start_y', self._run_start_pose[1] if self._run_start_pose else ''),
+            ('start_yaw', self._run_start_pose[2] if self._run_start_pose else ''),
+            ('target_x', self._run_target_pose[0] if self._run_target_pose else ''),
+            ('target_y', self._run_target_pose[1] if self._run_target_pose else ''),
+            ('target_yaw', self._run_target_pose[2] if self._run_target_pose else ''),
+            ('path_points', stats_points),
+            ('path_length_est_m', stats_len),
+            ('num_reverse_switch', stats_switch),
+            ('lookahead_distance_base', self.lookahead_distance_base),
+            ('lookahead_gain', self.lookahead_gain),
+            ('min_lookahead', self.min_lookahead),
+            ('max_lookahead', self.max_lookahead),
+            ('arrival_distance_threshold', self.arrival_distance_threshold),
+            ('arrival_heading_threshold_deg', float(np.degrees(self.arrival_heading_threshold))),
+            ('planner', 'RSAStarPlanner + clothoid.fit_and_speed + clothoid.resample_uniform_time'),
+        ]
+        self._write_meta_csv(meta)
+
+        self.get_logger().info(f'Run logging finalized: {self.run_dir} (result={result})')
+
+        # reset
+        self.run_dir = None
+        self.run_id = None
+        self.run_start_time_unix = None
+        self.run_end_time_unix = None
         
 
     def visualize_target_docking_zone(self):
@@ -373,6 +677,13 @@ class wamv_auto_sys(Node):
         resample_path = clothoid.resample_uniform_time(clothoid_path, dt=0.1)
         self.get_logger().debug(f'Resampled path: {resample_path}.')
         self.path = clothoid.pack_points_with_velocity(resample_path)
+
+        # 规划完成：落盘 planning_path.csv（保留 clothoid 的完整列）
+        try:
+            self._log_planning_path_csv(self.path)
+        except Exception:
+            pass
+
         return self.path
 
     def show_path(self):
@@ -989,7 +1300,10 @@ class wamv_auto_sys(Node):
         
         
         # 6. 关键修改：使用前瞻点的速度，确保航向和速度一致
-        target_speed = lookahead_point[3] if len(lookahead_point) > 3 else 0.0
+        if abs(lookahead_point[3]) < self.min_approach_speed:
+            target_speed = np.sign(self.wamv.state.v) * self.min_approach_speed  # 保持当前方向的最低速度
+        else:
+            target_speed = lookahead_point[3]    
         
         # 5. 计算目标航向（基于前瞻点）
         dx = lookahead_point[0] - self.wamv.state.x
@@ -1044,6 +1358,11 @@ class wamv_auto_sys(Node):
                 if self.auto_sys_status == Auto_sys_status.IDLE:
                     self.get_logger().info('Starting path planning...')
                     self.auto_sys_status = Auto_sys_status.PLANNING
+                    # 新任务开始：创建 run 目录并初始化日志
+                    try:
+                        self._start_new_run_logging()
+                    except Exception:
+                        pass
                     # 重置路径跟踪状态
                     self.current_target_idx = 0
                     self.near_target_start_time = None
@@ -1061,6 +1380,10 @@ class wamv_auto_sys(Node):
                     else:
                         self.get_logger().error('Path planning failed, returning to IDLE state.')
                         self.auto_sys_status = Auto_sys_status.IDLE
+                        try:
+                            self._finalize_run_logging(result='ERROR', reason='planning_failed')
+                        except Exception:
+                            pass
                     self.target_received = False
                 else:
                     self.get_logger().info(f'System currently busy({self.auto_sys_status}), cannot process new target.')
@@ -1070,6 +1393,10 @@ class wamv_auto_sys(Node):
                     self.current_target_idx = 0
                     self.near_target_start_time = None
                     self.auto_sys_status = Auto_sys_status.IDLE
+                    try:
+                        self._finalize_run_logging(result='DOCKED', reason='arrived')
+                    except Exception:
+                        pass
             #     if self.auto_sys_status == Auto_sys_status.NAVIGATING:
             #         self.get_logger().info('Navigating to target... TBA....')
             #         self.get_logger().info('Navigation complete, returning to IDLE state.')
@@ -1117,7 +1444,7 @@ class wamv_auto_sys(Node):
                     dx = self.path[self.reverse_switch_idx][0] - self.wamv.state.x
                     dy = self.path[self.reverse_switch_idx][1] - self.wamv.state.y
                     dist_to_switch = np.sqrt(dx**2 + dy**2)
-                    if dist_to_switch < self.path_progress_threshold:
+                    if dist_to_switch < self.cusp_approach_zone_distance:
                         self.get_logger().info(f'Enter reverse switch point {self.reverse_switch_idx} zone, switching to CUSP_APPROACH mode')
                         self.auto_sys_status = Auto_sys_status.CUSP_APPROACH
                     else:
@@ -1133,6 +1460,11 @@ class wamv_auto_sys(Node):
                                                f'   Current Speed/ Target Speed: {self.wamv.state.v:.2f} m/s / {target_speed:.2f} m/s')
                         self.wamv.pos_pid.update_target(target_yaw)
                         self.wamv.thrust_pid.update_target(target_speed)
+                        # logging
+                        try:
+                            self._append_nav_row(target_yaw=target_yaw, target_speed=target_speed, lookahead_idx=lookahead_idx, dist_to_switch=dist_to_switch)
+                        except Exception:
+                            pass
                         # # 实时更新前瞻点标记
                         # try:
                         #     self.update_lookahead_marker_gz(self.path[lookahead_idx], lookahead_idx)
@@ -1159,20 +1491,31 @@ class wamv_auto_sys(Node):
                                                f'   Current Speed/ Target Speed: {self.wamv.state.v:.2f} m/s / {target_speed:.2f} m/s')
                         self.wamv.pos_pid.update_target(target_yaw)
                         self.wamv.thrust_pid.update_target(target_speed)
+                        try:
+                            self._append_nav_row(target_yaw=target_yaw, target_speed=target_speed, lookahead_idx=lookahead_idx, dist_to_end=dist_to_end)
+                        except Exception:
+                            pass
                         # # 实时更新前瞻点标记
                         # try:
                         #     self.update_lookahead_marker_gz(self.path[lookahead_idx], lookahead_idx)
                         # except Exception:
                         #     pass
             elif self.auto_sys_status == Auto_sys_status.CUSP_APPROACH:
+                closest_idx = self.find_closest_path_point(self.wamv.state.x, self.wamv.state.y, self.segment_start_idx, self.segment_end_idx)
+                self.current_idx = closest_idx
                 dx_switch = self.path[self.reverse_switch_idx][0] - self.wamv.state.x
                 dy_switch = self.path[self.reverse_switch_idx][1] - self.wamv.state.y
                 dist_to_switch = np.sqrt(dx_switch**2 + dy_switch**2)
                 
-                if dist_to_switch < self.arrival_distance_threshold:
+                if dist_to_switch < self.cusp_arrival_threshold:
                     self.get_logger().info(f'Reached reverse switch point {self.reverse_switch_idx}, switching direction.')
                     # 切换方向
+                    self.wamv.thrust_pid.update_target(0.0)
                     self.current_idx = self.reverse_switch_idx
+                    lookahead_idx = self.reverse_switch_idx
+                    if self.wamv.thrust_pid.enable_death_zone:
+                        self.wamv.thrust_pid.enable_death_zone = True
+                        self.get_logger().info('At reverse switch point, re-enabling thrust death zone')
                     self.auto_sys_status = Auto_sys_status.INIT_SEGMENT
                 else:
                     if self.wamv.thrust_pid.enable_death_zone:
@@ -1191,12 +1534,19 @@ class wamv_auto_sys(Node):
                                                f'   Current Speed/ Adjusted Speed: {self.wamv.state.v:.2f} m/s / {adjusted_speed:.2f} m/s')
                     self.wamv.pos_pid.update_target(target_yaw)
                     self.wamv.thrust_pid.update_target(adjusted_speed)
+                    # logging
+                    try:
+                        self._append_nav_row(target_yaw=target_yaw, target_speed=adjusted_speed, lookahead_idx=lookahead_idx, dist_to_switch=dist_to_switch)
+                    except Exception:
+                        pass
                     # # 实时更新前瞻点标记
                     # try:
                     #     self.update_lookahead_marker_gz(self.path[lookahead_idx], lookahead_idx)
                     # except Exception:
                     #     pass
             elif self.auto_sys_status == Auto_sys_status.TARGET_APPROACH:
+                closest_idx = self.find_closest_path_point(self.wamv.state.x, self.wamv.state.y, self.segment_start_idx, self.segment_end_idx)
+                self.current_idx = closest_idx
                 # 1. 计算到终点的距离
                 dx_end = self.path[-1][0] - self.wamv.state.x
                 dy_end = self.path[-1][1] - self.wamv.state.y
@@ -1212,6 +1562,11 @@ class wamv_auto_sys(Node):
                         # 恢复死区设置
                         self.wamv.thrust_pid.enable_death_zone = True
                         self.auto_sys_status = Auto_sys_status.DOCKED
+                        # logging（最后一条）
+                        try:
+                            self._append_nav_row(target_yaw=self.path[-1][2], target_speed=0.0, lookahead_idx=len(self.path)-1, dist_to_end=dist_to_end)
+                        except Exception:
+                            pass
                     else:
                         self.get_logger().info(
                             f'Close to destination ({dist_to_end:.2f}m) but heading error too large '
@@ -1235,6 +1590,11 @@ class wamv_auto_sys(Node):
                                                f'   Current Speed/ Adjusted Speed: {self.wamv.state.v:.2f} m/s / {adjusted_speed:.2f} m/s')
                     self.wamv.pos_pid.update_target(target_yaw)
                     self.wamv.thrust_pid.update_target(adjusted_speed)
+                    # logging
+                    try:
+                        self._append_nav_row(target_yaw=target_yaw, target_speed=adjusted_speed, lookahead_idx=lookahead_idx, dist_to_end=dist_to_end)
+                    except Exception:
+                        pass
                     # # 实时更新前瞻点标记
                     # try:
                     #     self.update_lookahead_marker_gz(self.path[lookahead_idx], lookahead_idx)
@@ -1257,6 +1617,11 @@ class wamv_auto_sys(Node):
             elif self.auto_sys_status == Auto_sys_status.DOCKED:
                 # 保持停船状态
                 self.wamv.thrust_pid.update_target(0.0)
+                # logging：停靠后也可以留一条“保持”记录（不强制）
+                try:
+                    self._append_nav_row(target_yaw=getattr(self.wamv.pos_pid, 'target', None), target_speed=0.0)
+                except Exception:
+                    pass
                 
             # 9. 日志输出（每秒输出一次）
             # current_time = time.time()
